@@ -44,9 +44,14 @@ Short options can be combined: -ic is -i -c, and -m5 or -im 5 set the count.
 Options can go before or after PATTERN and DIR; put -- before a PATTERN that
 starts with a dash.
 
+Each commit shows the pull request it came in with, when its history says:
+a merge or squash commit that names one (#12 on GitHub, !12 for a GitLab
+merge request), or the merge that brought the commit into a branch.
+
 On a terminal, results are grouped under each repository. When piped, each
 commit is one tab-separated line: repository, commit, date, author, branch,
-subject. Exits 0 if any commit matched, 1 if none did, 2 on an error.
+pull request (empty if none), subject. Exits 0 if any commit matched, 1 if
+none did, 2 on an error.
 EOF
 }
 
@@ -129,7 +134,7 @@ esac
 
 # Fields are tab-separated; the subject goes last so a tab in it can't shift
 # the others.
-log_args=(log --no-color --date=short --source "--format=%h%x09%ad%x09%an%x09%S%x09%s")
+log_args=(log --no-color --date=short --source "--format=%H%x09%h%x09%ad%x09%an%x09%S%x09%s")
 [[ "$ignore_case" == 0 ]] || log_args+=(--regexp-ignore-case)
 if [[ "$have_pattern" == 1 && "$code" == 1 ]]; then
   if [[ "$regex" == 1 ]]; then log_args+=("-G$pattern"); else log_args+=("-S$pattern"); fi
@@ -178,8 +183,115 @@ search_repo() {
   elif [[ -z "$out" ]]; then
     echo none
   else
-    printf 'match\n%s\n' "$out"
+    echo match
+    # merges can come from any branch, even with --current
+    local -a all=(--branches --remotes)
+    ! git -C "$repo" rev-parse --quiet --verify HEAD >/dev/null 2>&1 || all+=(HEAD)
+    with_pull_requests "$repo" "$out" "${all[@]}"
   fi
+}
+
+# Pull requests, found offline in commit messages as their hosts write them:
+# "#12" (GitHub merges and squashes, Bitbucket, Azure DevOps) or "!12"
+# (GitLab merge requests). Reads NUL-free records "<hash> <message>",
+# separated by \036, and prints "<hash><TAB><pull request>" for each message
+# that names one.
+# shellcheck disable=SC2016,SC2089  # an awk program, not shell
+PR_AWK='BEGIN { RS = "\036" }
+{
+  sub(/^\n/, "")
+  hash = substr($0, 1, index($0, " ") - 1)
+  msg = substr($0, index($0, " ") + 1)
+  subject = msg
+  sub(/\n.*/, "", subject)
+  pr = ""
+  if (match(msg, /See merge request [^ \t\n]*![0-9]+/)) {
+    pr = substr(msg, RSTART, RLENGTH); sub(/.*!/, "!", pr)
+  } else if (match(subject, /^Merge pull request #[0-9]+ / ) ||
+             match(subject, /\(#[0-9]+\)$/) ||
+             match(subject, /\(pull request #[0-9]+\)/)) {
+    pr = substr(subject, RSTART, RLENGTH); sub(/^[^#]*/, "", pr); sub(/[^0-9]+$/, "", pr)
+  } else if (match(subject, /^Merged PR [0-9]+:/)) {
+    pr = substr(subject, RSTART + 10, RLENGTH - 11); pr = "#" pr
+  }
+  if (pr != "") print hash "\t" pr
+}'
+
+# Rewrites git's lines - full hash, short hash, date, author, branch,
+# subject - as short hash, date, author, branch, pull request, subject.
+#
+# A commit's pull request is the one its own message names (a merge or squash
+# commit), else the one named by the merge that brought it into a branch: a
+# merge brings in the commits its other parents contain and its first parent
+# does not. The oldest such merge that names a pull request wins. All of it is
+# worked out offline in one pass over the history, oldest first, carrying at
+# each commit the set of matched commits it contains that have no pull request
+# yet. $1 = repo, $2 = git's lines, $3... = the refs to look for merges in.
+with_pull_requests() {
+  local repo="$1" lines="$2" tmp
+  shift 2
+  tmp="$(mktemp -d)"
+  # "<hash><TAB><pull request>" for every merge that names one, and for the
+  # matched commits that name one themselves
+  {
+    git -C "$repo" log --merges --format='%H %B%x1e' "$@" --
+    printf '%s\n' "$lines" | cut -f1 |
+      git -C "$repo" log --no-walk=unsorted --stdin --format='%H %B%x1e'
+  } 2>/dev/null | awk "$PR_AWK" >"$tmp/prs"
+  printf '%s\n' "$lines" | cut -f1 |
+    awk 'FNR == NR { known[$1] = 1; next } !($1 in known)' "$tmp/prs" - >"$tmp/open"
+  : >"$tmp/found"
+  if [[ -s "$tmp/open" ]]; then
+    git -C "$repo" rev-list --parents --topo-order --reverse "$@" 2>/dev/null |
+      awk -v prs="$tmp/prs" -v open="$tmp/open" '
+        BEGIN {
+          while ((getline line < prs) > 0) { split(line, f, "\t"); pr[f[1]] = f[2] }
+          while ((getline line < open) > 0) wanted[line] = 1
+          sets = 0
+        }
+        # A set is an id: members[id] lists its commits, has[id, commit] marks them.
+        function add(id, x) { if (!((id, x) in has)) { has[id, x] = 1; members[id] = members[id] " " x } }
+        {
+          base = ($2 in set) ? set[$2] : 0
+          id = base
+          if (NF >= 3) {
+            # the commits this merge brings in, still without a pull request
+            brought = ""
+            for (k = 3; k <= NF; k++) {
+              if (!($k in set)) continue
+              n = split(members[set[$k]], xs, " ")
+              for (j = 1; j <= n; j++)
+                if (!(xs[j] in named) && !((base, xs[j]) in has)) brought = brought " " xs[j]
+            }
+            if (brought != "") {
+              n = split(brought, xs, " ")
+              if ($1 in pr) for (j = 1; j <= n; j++) {
+                if (!(xs[j] in named)) { named[xs[j]] = pr[$1]; print xs[j] "\t" pr[$1] }
+              } else {
+                # carried on, minus the ones named along the way
+                id = ++sets
+                m = split(members[base], ys, " ")
+                for (j = 1; j <= m; j++) if (!(ys[j] in named)) add(id, ys[j])
+                for (j = 1; j <= n; j++) add(id, xs[j])
+              }
+            }
+          }
+          if ($1 in wanted) {
+            old = id; id = ++sets
+            m = split(members[old], ys, " ")
+            for (j = 1; j <= m; j++) if (!(ys[j] in named)) add(id, ys[j])
+            add(id, $1)
+          }
+          if (id) set[$1] = id
+        }' >"$tmp/found"
+  fi
+  printf '%s\n' "$lines" | awk -F'\t' -v OFS='\t' 'FILENAME != "-" { pr[$1] = $2; next }
+    {
+      subject = $6
+      for (i = 7; i <= NF; i++) subject = subject "\t" $i
+      print $2, $3, $4, $5, ($1 in pr) ? pr[$1] : "", subject
+    }' "$tmp/prs" "$tmp/found" -
+  rm -rf "$tmp"
 }
 
 # Runs inside the worker pool: $1 = scratch dir, $2 = index, $3 = repo.
@@ -245,14 +357,15 @@ print_commits() {
     -v heading="$heading" -v label="$label" \
     -v y="$yellow" -v d="$dim" -v r="$reset" '
     {
-      subject = $5
-      for (i = 6; i <= NF; i++) subject = subject "\t" $i
+      subject = $6
+      for (i = 7; i <= NF; i++) subject = subject "\t" $i
       branch = $4
       sub(/^refs\/(heads|remotes)\//, "", branch)
+      pr = $5 == "" ? "" : ", " $5
       if (heading == 1)
-        printf "  %s%s%s  %s%s%s  %s  %s(%s, %s)%s\n", y, $1, r, d, $2, r, subject, d, $3, branch, r
+        printf "  %s%s%s  %s%s%s  %s  %s(%s, %s%s)%s\n", y, $1, r, d, $2, r, subject, d, $3, branch, pr, r
       else
-        print label, $1, $2, $3, branch, subject
+        print label, $1, $2, $3, branch, $5, subject
     }'
 }
 
@@ -278,7 +391,8 @@ consume() {
   esac
 }
 
-export LOGR_ARGS current root
+# shellcheck disable=SC2090  # PR_AWK is an awk program, passed to awk whole
+export LOGR_ARGS PR_AWK current root
 if ((jobs > 1 && count > 1)); then
   scratch="$(mktemp -d)"
   pool=""
@@ -297,7 +411,7 @@ if ((jobs > 1 && count > 1)); then
   trap 'stop_pool; rm -rf "$scratch"' EXIT
   trap 'exit 130' INT TERM
   export GIT_TERMINAL_PROMPT=0
-  export -f worker search_repo repo_label
+  export -f worker search_repo repo_label with_pull_requests
   # shellcheck disable=SC2016  # the single-quoted body runs inside the child shell
   for ((i = 0; i < count; i++)); do printf '%s\0%s\0' "$i" "${repos[i]}"; done |
     xargs -0 -n 2 -P "$jobs" "$BASH" -c 'worker "$@"' _ "$scratch" &

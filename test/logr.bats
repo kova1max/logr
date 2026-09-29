@@ -34,24 +34,18 @@ repo() {
   repo zzz; commit zzz "nothing here"
   run logr login ws
   [ "$status" -eq 0 ]
-  [[ "${lines[0]}" == "api"$'\t'*$'\t'"2026-09-01"$'\t'"Ann Author"$'\t'"main"$'\t'"fix login redirect" ]]
+  [[ "${lines[0]}" == "api"$'\t'*$'\t'"2026-09-01"$'\t'"Ann Author"$'\t'"main"$'\t'$'\t'"fix login redirect" ]]
   [[ "${lines[1]}" == "web"$'\t'*$'\t'"Login page: fix spacing" ]]
   [[ "$output" != *"unrelated"* && "$output" != *"nothing here"* ]]
   [[ "$output" == *"2 commits in 2 of 3 repositories"* ]]
 }
 
-@test "piped output is tab-separated: repo, commit, date, author, branch, subject" {
+@test "piped output is tab-separated: repo, commit, date, author, branch, pull request, subject" {
   repo api; commit api "add feature"
   run --separate-stderr logr feature ws
   [ "$status" -eq 0 ]
   [ "${#lines[@]}" -eq 1 ]
-  IFS=$'\t' read -r r sha date author branch subject <<<"${lines[0]}"
-  [ "$r" = api ]
-  [ "$sha" = "$(git -C ws/api rev-parse --short HEAD)" ]
-  [ "$date" = 2026-09-01 ]
-  [ "$author" = "Ann Author" ]
-  [ "$branch" = main ]
-  [ "$subject" = "add feature" ]
+  [ "${lines[0]}" = "api"$'\t'"$(git -C ws/api rev-parse --short HEAD)"$'\t'"2026-09-01"$'\t'"Ann Author"$'\t'"main"$'\t'$'\t'"add feature" ]
   [[ "$stderr" == *"1 commit in 1 of 1 repository"* ]]
 }
 
@@ -89,7 +83,7 @@ repo() {
   git -C ws/r checkout -q main
   run logr "in progress" ws
   [ "$status" -eq 0 ]
-  [[ "${lines[0]}" == *$'\t'"feature/login"$'\t'"login work in progress" ]]
+  [[ "${lines[0]}" == *$'\t'"feature/login"$'\t'$'\t'"login work in progress" ]]
 }
 
 @test "finds commits that only exist on a remote-tracking branch" {
@@ -103,7 +97,7 @@ repo() {
   git -C ws/r fetch -q
   run logr colleague ws
   [ "$status" -eq 0 ]
-  [[ "$output" == *$'\t'"Bob"$'\t'"origin/colleague"$'\t'"colleague fix for login"* ]]
+  [[ "$output" == *$'\t'"Bob"$'\t'"origin/colleague"$'\t'$'\t'"colleague fix for login"* ]]
 }
 
 @test "--current searches only the checked-out branch" {
@@ -111,10 +105,10 @@ repo() {
   git -C ws/r checkout -q -b other && commit r "other login" && git -C ws/r checkout -q main
   run --separate-stderr logr --current login ws
   [ "${#lines[@]}" -eq 1 ]
-  [[ "${lines[0]}" == *$'\t'"main"$'\t'"base login" ]]
+  [[ "${lines[0]}" == *$'\t'"main"$'\t'$'\t'"base login" ]]
   git -C ws/r checkout -q --detach other
   run --separate-stderr logr --current login ws
-  [[ "${lines[0]}" == *$'\t'"HEAD"$'\t'"other login" ]]
+  [[ "${lines[0]}" == *$'\t'"HEAD"$'\t'$'\t'"other login" ]]
 }
 
 @test "a commit on several branches is listed once" {
@@ -158,18 +152,98 @@ repo() {
   [[ "$output" == *"login 3"* && "$output" == *"login 2"* && "$output" != *"login 1"* ]]
 }
 
+# merge_pr REPO BRANCH MESSAGE - merge BRANCH into the checked-out branch
+merge_pr() {
+  GIT_AUTHOR_DATE=2026-09-02T12:00:00 GIT_COMMITTER_DATE=2026-09-02T12:00:00 \
+    git -C "ws/$1" merge -q --no-ff -m "$3" "$2"
+}
+
+# the pull request column of the piped line whose subject is SUBJECT
+pr_of() {
+  printf '%s\n' "${lines[@]}" | awk -F'\t' -v s="$1" '$7 == s { print $6 }'
+}
+
+@test "shows the GitHub pull request of a merge and of the commits it brought in" {
+  repo r; commit r "base"
+  git -C ws/r checkout -q -b fix/login
+  commit r "login: first try"; commit r "login: second try"
+  git -C ws/r checkout -q main
+  merge_pr r fix/login "Merge pull request #12 from ann/fix/login"
+  run --separate-stderr logr login ws
+  [ "$(pr_of "login: first try")" = "#12" ]
+  [ "$(pr_of "login: second try")" = "#12" ]
+  [ "$(pr_of "Merge pull request #12 from ann/fix/login")" = "#12" ]
+}
+
+@test "shows GitLab merge requests as !N" {
+  repo r; commit r "base"
+  git -C ws/r checkout -q -b fix/login && commit r "login fix" && git -C ws/r checkout -q main
+  merge_pr r fix/login "Merge branch 'fix/login' into 'main'
+
+Fix login
+
+See merge request group/sub/project!56"
+  run --separate-stderr logr login ws
+  [ "$(pr_of "login fix")" = "!56" ]
+  [ "$(pr_of "Merge branch 'fix/login' into 'main'")" = "!56" ]
+}
+
+@test "reads squash-merged, Bitbucket and Azure DevOps pull requests from the subject" {
+  repo r
+  commit r "Fix login redirect (#34)"
+  commit r "Merged in fix/login (pull request #335)"
+  commit r "Merged PR 78: fix login"
+  commit r "login (#notanumber)"
+  run --separate-stderr logr login ws
+  [ "$(pr_of "Fix login redirect (#34)")" = "#34" ]
+  [ "$(pr_of "Merged in fix/login (pull request #335)")" = "#335" ]
+  [ "$(pr_of "Merged PR 78: fix login")" = "#78" ]
+  [ "$(pr_of "login (#notanumber)")" = "" ]
+}
+
+@test "a commit made on the branch that was merged into gets no pull request" {
+  repo r; commit r "base"
+  git -C ws/r checkout -q -b feature && commit r "feature work" && git -C ws/r checkout -q main
+  commit r "direct login fix"
+  merge_pr r feature "Merge pull request #5 from ann/feature"
+  run --separate-stderr logr "login fix" ws
+  [ "${#lines[@]}" -eq 1 ]
+  [ "$(pr_of "direct login fix")" = "" ]
+}
+
+@test "the oldest merge that names a pull request wins; unmerged commits get none" {
+  repo r; commit r "base"
+  git -C ws/r checkout -q -b develop
+  git -C ws/r checkout -q -b fix/login && commit r "login fix" && git -C ws/r checkout -q develop
+  # a local merge names no pull request: the next merge up does
+  merge_pr r fix/login "Merge branch 'fix/login' into develop"
+  git -C ws/r checkout -q -b fix/logout main && commit r "logout login tweak" && git -C ws/r checkout -q develop
+  merge_pr r fix/logout "Merge pull request #7 from ann/fix/logout"
+  git -C ws/r checkout -q main
+  merge_pr r develop "Merge pull request #9 from ann/develop"
+  git -C ws/r checkout -q -b wip && commit r "login wip" && git -C ws/r checkout -q main
+  run --separate-stderr logr login ws
+  [ "$(pr_of "login fix")" = "#9" ]
+  [ "$(pr_of "logout login tweak")" = "#7" ]
+  [ "$(pr_of "login wip")" = "" ]
+}
+
 @test "on a terminal, results are grouped under each repository" {
   repo api; commit api "fix login"
+  repo pr; commit pr "Login page: fix spacing (#4)"
   repo web; commit web "login page"
   run logr_tty --no-color login ws
   [ "$status" -eq 0 ]
   [[ "$output" == "api
   "*"  2026-09-01  fix login  (Ann Author, main)
 
+pr
+  "*"  2026-09-01  Login page: fix spacing (#4)  (Ann Author, main, #4)
+
 web
   "*"  2026-09-01  login page  (Ann Author, main)
 
-2 commits in 2 of 2 repositories"* ]]
+3 commits in 3 of 3 repositories"* ]]
 }
 
 @test "colors on a terminal, not with NO_COLOR or --no-color" {

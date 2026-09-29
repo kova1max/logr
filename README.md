@@ -13,13 +13,14 @@ repos did that ticket touch?" means running `git log --grep` in each one.
 ```console
 $ logr PROJ-142 ~/work
 api
-  3f9c2a1  2026-09-23  PROJ-142: validate redirect URL  (Ann Lee, main)
+  3f9c2a1  2026-09-23  PROJ-142: validate redirect URL (#212)  (Ann Lee, main, #212)
   b71e0d4  2026-09-22  PROJ-142: add failing test  (Ann Lee, origin/fix/PROJ-142)
 
 web
-  c02a9f7  2026-09-24  Merge branch 'fix/PROJ-142' into 'main'  (Bob Stone, origin/main)
+  c02a9f7  2026-09-24  Merge branch 'fix/PROJ-142' into 'main'  (Bob Stone, origin/main, !88)
+  5d1e6b2  2026-09-23  PROJ-142: keep the return URL  (Bob Stone, fix/PROJ-142, !88)
 
-3 commits in 2 of 14 repositories
+4 commits in 2 of 14 repositories
 ```
 
 ## Install
@@ -119,16 +120,36 @@ logr -m 1 --current release
 
 On a terminal, commits are grouped under each repository, newest first, as
 in the example at the top. When the output is piped, each commit is one
-tab-separated line - repository, commit, date, author, branch, subject - so it
-works with `cut`, `sort` and `awk`:
+tab-separated line - repository, commit, date, author, branch, pull request
+(empty if none), subject - so it works with `cut`, `sort` and `awk`:
 
 ```console
-$ logr PROJ-142 ~/work | cut -f1 | sort -u
-api
-web
+$ logr PROJ-142 ~/work | awk -F'\t' '$6 != "" { print $1, $6 }' | sort -u
+api #212
+web !88
 ```
 
 The summary line and any errors go to stderr, so piped output stays pure data.
+
+### Pull requests
+
+Each commit shows the pull request it came in with, worked out from the
+history on disk - no API calls, no tokens:
+
+- a merge or squash commit that names one: `Merge pull request #12` and
+  `Fix login (#12)` on GitHub, `See merge request group/project!12` on GitLab
+  (shown as `!12`), `(pull request #12)` on Bitbucket and `Merged PR 12:` on
+  Azure DevOps;
+- any other commit gets the pull request of the merge that brought it into a
+  branch - the oldest one that names a pull request, if it was merged more
+  than once.
+
+A commit that never came in through a pull request - made directly on the
+branch it is on, or on a branch not merged yet - has none. Fetch first to see
+pull requests merged since your last fetch.
+
+### Exit codes
+
 Exits `0` if any commit matched, `1` if none did, and `2` on invalid arguments
 or if a repository could not be searched, like `grep`.
 
