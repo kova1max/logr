@@ -70,10 +70,11 @@ case), so `logr login` finds "Login" while `logr PROJ-142` does not find
 
 Every local and remote-tracking branch is searched, and each commit is listed
 once, with the branch it was found on. Options can go before or after
-`PATTERN` and `DIR`, and short options can be combined: `-ic` is `-i -c`, and
-`-m5` or `-im 5` set the count.
+`PATTERN` and `DIR`.
 
-| Option&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; | Default | Meaning |
+Short options can be combined: `-ic` is `-i -c`, and `-m5` or `-im 5` set the count.
+
+| Option&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; | Default | Meaning |
 | :--- | :--- | :--- |
 | `DIR`, `-C DIR` | current&nbsp;directory | Where to look for repositories |
 | `-E`, `--regex` | | Treat `PATTERN` as an extended regular expression |
@@ -81,7 +82,8 @@ once, with the branch it was found on. Options can go before or after
 | `--case-sensitive` | smart case | Never ignore case |
 | `-c`, `--code` | | Search the changes instead of the messages: list the commits that add or remove `PATTERN` (`git log -S`, or `-G` with `--regex`). Slower on large histories. |
 | `--author WHO` | | Only commits by an author whose name or email matches `WHO` |
-| `--since DATE`, `--until DATE` | | Only commits after or before `DATE`, e.g. `2026-09-01` or `2.weeks` |
+| `--since DATE` | | Only commits after `DATE`, e.g. `2026-09-01` or `2.weeks` |
+| `--until DATE` | | Only commits before `DATE` |
 | `--current` | | Only search the checked-out branch of each repository |
 | `-m`, `--max-count N` | | Show at most `N` commits per repository |
 | `-j`, `--jobs N` | `8` | Search up to `N` repositories in parallel. Output is printed in discovery order, so it reads the same as a sequential run. |
@@ -97,11 +99,20 @@ once, with the branch it was found on. Options can go before or after
 ### Examples
 
 ```sh
-logr PROJ-142 ~/work                         # every commit that mentions a ticket
-logr '' ~/work --author ann --since monday   # what Ann committed this week
-logr -E 'revert|rollback' --since 1.month    # recent reverts, from the current directory
-logr -c getUserInfo ~/work                   # the commits that added or removed a call
-logr -m 1 --current release                  # the latest release commit on each checked-out branch
+# every commit that mentions a ticket
+logr PROJ-142 ~/work
+
+# what Ann committed in the last week
+logr '' ~/work --author ann --since 1.week
+
+# recent reverts, searching from the current directory
+logr -E 'revert|rollback' --since 1.month
+
+# the commits that added or removed a call
+logr -c getUserInfo ~/work
+
+# the latest release commit on each checked-out branch
+logr -m 1 --current release
 ```
 
 ### Output
