@@ -185,7 +185,7 @@ search_repo() {
 # Runs inside the worker pool: $1 = scratch dir, $2 = index, $3 = repo.
 # The result file appears atomically (write, then rename) so the collector
 # can print results in order as they land.
-# shellcheck disable=SC2329  # invoked by name inside the xargs worker pool
+# shellcheck disable=SC2317,SC2329  # invoked by name inside the xargs worker pool
 worker() {
   exec </dev/null
   search_repo "$3" >"$1/$2.tmp" 2>&1 || true
@@ -286,7 +286,7 @@ if ((jobs > 1 && count > 1)); then
   # the pipe after a few lines. Pausing xargs first keeps it from starting new
   # workers while the running ones are killed; searches are read-only, so
   # cutting one short is harmless.
-  # shellcheck disable=SC2329  # called from the EXIT trap
+  # shellcheck disable=SC2317,SC2329  # called from the EXIT trap
   stop_pool() {
     [[ -n "$pool" ]] && kill -STOP "$pool" 2>/dev/null || return 0
     pkill -P "$pool" 2>/dev/null || true
