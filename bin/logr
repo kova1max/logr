@@ -1,0 +1,334 @@
+#!/usr/bin/env bash
+# Search the commit history of every git repository under a directory.
+# Usage: logr [options] [PATTERN] [DIR]
+set -euo pipefail
+
+VERSION="0.0.0" # set by the release workflow
+
+usage() {
+  cat <<'EOF'
+Usage: logr [options] [PATTERN] [DIR]
+
+Finds git repositories under DIR (default: current directory) and lists the
+commits whose message contains PATTERN, across all local and remote-tracking
+branches. Read-only: nothing is fetched or changed.
+
+PATTERN is literal text. Lowercase text matches any case; text with a capital
+letter matches exactly (smart case). To search only by --author, --since or
+--until, leave PATTERN out, or pass '' when also giving DIR.
+
+Options:
+  -E, --regex        Treat PATTERN as an extended regular expression.
+  -i, --ignore-case  Always ignore case.
+      --case-sensitive
+                     Never ignore case.
+  -c, --code         Search the changes instead of the messages: list the
+                     commits that add or remove PATTERN (git log -S, or -G
+                     with --regex). Slower on large histories.
+      --author WHO   Only commits by an author matching WHO (name or email).
+      --since DATE   Only commits after DATE, e.g. 2026-09-01 or 2.weeks.
+      --until DATE   Only commits before DATE.
+      --current      Only search the checked-out branch of each repository.
+  -m, --max-count N  Show at most N commits per repository.
+  -C DIR             Search under DIR (same as giving DIR after PATTERN).
+  -j, --jobs N       Search up to N repositories in parallel (default: 8).
+      --max-depth N  How many directory levels below DIR to search (default: 2).
+                     0 = only DIR itself, 1 = DIR and its direct children, ...
+  -s, --submodules   Also search each checked-out submodule.
+      --no-color     Disable colored output. Also disabled when NO_COLOR is
+                     set (https://no-color.org) or output is not a terminal.
+  -V, --version      Print the version.
+  -h, --help         Show this help.
+
+Short options can be combined: -ic is -i -c, and -m5 or -im 5 set the count.
+Options can go before or after PATTERN and DIR; put -- before a PATTERN that
+starts with a dash.
+
+On a terminal, results are grouped under each repository. When piped, each
+commit is one tab-separated line: repository, commit, date, author, branch,
+subject. Exits 0 if any commit matched, 1 if none did, 2 on an error.
+EOF
+}
+
+pattern="" have_pattern=0
+regex=0 case_mode=smart code=0 current=0
+author="" since="" until="" max_count=""
+jobs=8 max_depth=2 submodules=0 color=1
+root=""
+args=() # positional arguments; options may come before or after them
+
+while (($#)); do
+  case "$1" in
+    # bundled short options: split -ic into -i -c, and -m5 into -m 5
+    -[!-]?*)
+      opt="${1:1:1}" rest="${1:2}"
+      shift
+      case "$opt" in
+        j|m|C) set -- "-$opt" "$rest" "$@" ;;
+        *) set -- "-$opt" "-$rest" "$@" ;;
+      esac
+      ;;
+    -E|--regex) regex=1; shift ;;
+    -i|--ignore-case) case_mode=ignore; shift ;;
+    --case-sensitive) case_mode=exact; shift ;;
+    -c|--code) code=1; shift ;;
+    --author) author="${2:-}"; shift 2 || { usage >&2; exit 2; } ;;
+    --author=*) author="${1#*=}"; shift ;;
+    --since) since="${2:-}"; shift 2 || { usage >&2; exit 2; } ;;
+    --since=*) since="${1#*=}"; shift ;;
+    --until) until="${2:-}"; shift 2 || { usage >&2; exit 2; } ;;
+    --until=*) until="${1#*=}"; shift ;;
+    --current) current=1; shift ;;
+    -m|--max-count) max_count="${2:-}"; shift 2 || { usage >&2; exit 2; } ;;
+    --max-count=*) max_count="${1#*=}"; shift ;;
+    -C) root="${2:-}"; shift 2 || { usage >&2; exit 2; } ;;
+    -j|--jobs) jobs="${2:-}"; shift 2 || { usage >&2; exit 2; } ;;
+    --jobs=*) jobs="${1#*=}"; shift ;;
+    --max-depth) max_depth="${2:-}"; shift 2 || { usage >&2; exit 2; } ;;
+    --max-depth=*) max_depth="${1#*=}"; shift ;;
+    -s|--submodules) submodules=1; shift ;;
+    --no-color) color=0; shift ;;
+    -h|--help) usage; exit 0 ;;
+    -V|--version) echo "logr $VERSION"; exit 0 ;;
+    --) shift; while (($#)); do args+=("$1"); shift; done ;;
+    -?*) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+
+# Positional arguments: PATTERN, then DIR. An empty PATTERN means "no text
+# filter", for searching by --author etc. with a DIR: logr '' ~/work --author ann.
+((${#args[@]} <= 2)) || { echo "Too many arguments: ${args[*]}" >&2; usage >&2; exit 2; }
+((${#args[@]} < 1)) || pattern="${args[0]}"
+[[ -z "$pattern" ]] || have_pattern=1
+if ((${#args[@]} == 2)); then
+  [[ -z "$root" ]] || { echo "DIR given twice (-C and after PATTERN)" >&2; exit 2; }
+  root="${args[1]}"
+fi
+
+[[ "$have_pattern" == 1 || -n "$author" || -n "$since" || -n "$until" ]] ||
+  { echo "Nothing to search for: give a PATTERN or --author/--since/--until" >&2; usage >&2; exit 2; }
+[[ "$have_pattern" == 1 || "$code" == 0 ]] || { echo "--code needs a PATTERN" >&2; exit 2; }
+[[ "$jobs" =~ ^[1-9][0-9]*$ ]] || { echo "--jobs must be a positive integer" >&2; exit 2; }
+[[ "$max_depth" =~ ^[0-9]+$ ]] || { echo "--max-depth must be a non-negative integer" >&2; exit 2; }
+[[ -z "$max_count" || "$max_count" =~ ^[1-9][0-9]*$ ]] || { echo "--max-count must be a positive integer" >&2; exit 2; }
+root="${root:-.}"
+[[ -d "$root" ]] || { echo "Not a directory: $root" >&2; exit 2; }
+root="$(cd "$root" && pwd)"
+
+# --- the git log command -------------------------------------------------------
+
+# Smart case: ignore case unless the text searched for has a capital letter.
+case_text="$pattern"
+[[ "$have_pattern" == 1 ]] || case_text="$author"
+ignore_case=0
+case "$case_mode" in
+  ignore) ignore_case=1 ;;
+  smart) [[ "$case_text" =~ [[:upper:]] ]] || ignore_case=1 ;;
+esac
+
+# Fields are tab-separated; the subject goes last so a tab in it can't shift
+# the others.
+log_args=(log --no-color --date=short --source "--format=%h%x09%ad%x09%an%x09%S%x09%s")
+[[ "$ignore_case" == 0 ]] || log_args+=(--regexp-ignore-case)
+if [[ "$have_pattern" == 1 && "$code" == 1 ]]; then
+  if [[ "$regex" == 1 ]]; then log_args+=("-G$pattern"); else log_args+=("-S$pattern"); fi
+elif [[ "$have_pattern" == 1 ]]; then
+  if [[ "$regex" == 1 ]]; then log_args+=(--extended-regexp); else log_args+=(--fixed-strings); fi
+  log_args+=("--grep=$pattern")
+fi
+[[ -z "$author" ]] || log_args+=("--author=$author")
+[[ -z "$since" ]] || log_args+=("--since=$since")
+[[ -z "$until" ]] || log_args+=("--until=$until")
+[[ -z "$max_count" ]] || log_args+=("--max-count=$max_count")
+
+if [[ "$color" == 1 && -z "${NO_COLOR:-}" && -t 1 ]]; then
+  bold=$'\e[1m' yellow=$'\e[33m' red=$'\e[31m' dim=$'\e[2m' reset=$'\e[0m'
+else
+  bold="" yellow="" red="" dim="" reset=""
+fi
+
+# --- per-repository search -------------------------------------------------------
+# search_repo prints a result: the first line is "match", "none" or
+# "failed<TAB>label", the rest are git's tab-separated commit lines (or the
+# error). Formatting happens in the parent, so workers stay simple.
+
+repo_label() {
+  local rel="${1#"$root"}"
+  rel="${rel#/}"
+  printf '%s' "${rel:-.}"
+}
+
+search_repo() {
+  local repo="$1" out
+  local -a args refs
+  eval "args=($LOGR_ARGS)"
+  if [[ "$current" == 1 ]]; then
+    # an unborn branch has no commits to search
+    git -C "$repo" rev-parse --quiet --verify HEAD >/dev/null 2>&1 || { echo none; return; }
+    # the branch by name, so it shows in the output; HEAD when detached
+    refs=("$(git -C "$repo" symbolic-ref --quiet HEAD || echo HEAD)")
+  else
+    refs=(--branches --remotes)
+    # a detached HEAD may hold commits no branch reaches
+    ! git -C "$repo" rev-parse --quiet --verify HEAD >/dev/null 2>&1 || refs+=(HEAD)
+  fi
+  if ! out="$(git -C "$repo" "${args[@]}" "${refs[@]}" -- 2>&1)"; then
+    printf 'failed\t%s\n%s\n' "$(repo_label "$repo")" "$out"
+  elif [[ -z "$out" ]]; then
+    echo none
+  else
+    printf 'match\n%s\n' "$out"
+  fi
+}
+
+# Runs inside the worker pool: $1 = scratch dir, $2 = index, $3 = repo.
+# The result file appears atomically (write, then rename) so the collector
+# can print results in order as they land.
+# shellcheck disable=SC2329  # invoked by name inside the xargs worker pool
+worker() {
+  exec </dev/null
+  search_repo "$3" >"$1/$2.tmp" 2>&1 || true
+  mv "$1/$2.tmp" "$1/$2.done"
+}
+
+# --- discovery ---------------------------------------------------------------------
+
+repos=()
+walk() {
+  local dir="$1" depth="$2"
+  if [[ -e "$dir/.git" ]]; then
+    repos+=("$dir")
+    [[ "$submodules" == 0 ]] || add_submodules "$dir"
+    return
+  fi
+  ((depth < max_depth)) || return 0
+  local child
+  for child in "$dir"/*/; do
+    [[ -d "$child" && ! -L "${child%/}" ]] || continue
+    walk "${child%/}" $((depth + 1))
+  done
+}
+# Checked-out submodules, recursively, in git's order.
+add_submodules() {
+  local sub
+  # shellcheck disable=SC2016  # $displaypath is expanded by git submodule foreach
+  while IFS= read -r sub; do
+    [[ -z "$sub" ]] || repos+=("$1/$sub")
+  done < <(git -C "$1" submodule foreach --quiet --recursive 'printf "%s\n" "$displaypath"' 2>/dev/null)
+}
+
+walk "$root" 0
+
+count=${#repos[@]}
+if ((count == 0)); then
+  echo "No git repositories found under $root (max depth $max_depth)" >&2
+  exit 1
+fi
+
+# --- output ------------------------------------------------------------------------
+
+LOGR_ARGS="$(printf '%q ' "${log_args[@]}")"
+[[ -t 1 ]] && heading=1 || heading=0
+matched_repos=0 commits=0 failed=0
+failed_repos=()
+
+# On a terminal: the repository, then one indented line per commit. Piped:
+# repository, commit, date, author, branch, subject - tab-separated.
+print_commits() {
+  local label="$1" lines="$2"
+  if [[ "$heading" == 1 ]]; then
+    ((matched_repos == 1)) || echo
+    printf '%s%s%s\n' "$bold" "$label" "$reset"
+  fi
+  printf '%s\n' "$lines" | awk -F'\t' -v OFS='\t' \
+    -v heading="$heading" -v label="$label" \
+    -v y="$yellow" -v d="$dim" -v r="$reset" '
+    {
+      subject = $5
+      for (i = 6; i <= NF; i++) subject = subject "\t" $i
+      branch = $4
+      sub(/^refs\/(heads|remotes)\//, "", branch)
+      if (heading == 1)
+        printf "  %s%s%s  %s%s%s  %s  %s(%s, %s)%s\n", y, $1, r, d, $2, r, subject, d, $3, branch, r
+      else
+        print label, $1, $2, $3, branch, subject
+    }'
+}
+
+consume() {
+  local text="$1" label="$2" head body
+  head="${text%%$'\n'*}"
+  body="${text#*$'\n'}"
+  [[ "$text" == *$'\n'* ]] || body=""
+  case "${head%%$'\t'*}" in
+    none) ;;
+    match)
+      matched_repos=$((matched_repos + 1))
+      commits=$((commits + $(printf '%s\n' "$body" | wc -l)))
+      print_commits "$label" "$body"
+      ;;
+    failed)
+      failed=$((failed + 1))
+      failed_repos+=("$label")
+      printf '%sx%s %s\n' "$red" "$reset" "$label" >&2
+      printf '    %s\n' "${body//$'\n'/$'\n'    }" >&2
+      ;;
+    *) echo "logr: unexpected worker result: $text" >&2; exit 2 ;;
+  esac
+}
+
+export LOGR_ARGS current root
+if ((jobs > 1 && count > 1)); then
+  scratch="$(mktemp -d)"
+  pool=""
+  # Stops the pool when logr exits early - e.g. piped into head, which closes
+  # the pipe after a few lines. Pausing xargs first keeps it from starting new
+  # workers while the running ones are killed; searches are read-only, so
+  # cutting one short is harmless.
+  # shellcheck disable=SC2329  # called from the EXIT trap
+  stop_pool() {
+    [[ -n "$pool" ]] && kill -STOP "$pool" 2>/dev/null || return 0
+    pkill -P "$pool" 2>/dev/null || true
+    kill "$pool" 2>/dev/null || true
+    kill -CONT "$pool" 2>/dev/null || true
+    wait "$pool" 2>/dev/null || true
+  }
+  trap 'stop_pool; rm -rf "$scratch"' EXIT
+  trap 'exit 130' INT TERM
+  export GIT_TERMINAL_PROMPT=0
+  export -f worker search_repo repo_label
+  # shellcheck disable=SC2016  # the single-quoted body runs inside the child shell
+  for ((i = 0; i < count; i++)); do printf '%s\0%s\0' "$i" "${repos[i]}"; done |
+    xargs -0 -n 2 -P "$jobs" "$BASH" -c 'worker "$@"' _ "$scratch" &
+  pool=$!
+  for ((i = 0; i < count; i++)); do
+    until [[ -e "$scratch/$i.done" ]]; do
+      if ! kill -0 "$pool" 2>/dev/null && [[ ! -e "$scratch/$i.done" ]]; then
+        echo "logr: worker pool exited before finishing $(repo_label "${repos[i]}")" >&2
+        exit 2
+      fi
+      sleep 0.05
+    done
+    consume "$(cat "$scratch/$i.done")" "$(repo_label "${repos[i]}")"
+  done
+  wait "$pool" || true
+  pool=""
+else
+  for ((i = 0; i < count; i++)); do
+    consume "$(search_repo "${repos[i]}")" "$(repo_label "${repos[i]}")"
+  done
+fi
+
+# The summary goes to stderr, so piped results stay pure data.
+{
+  ((heading == 0 || matched_repos == 0)) || echo
+  printf '%s%d commit%s in %d of %d repositor%s%s\n' "$dim" "$commits" \
+    "$([[ "$commits" == 1 ]] || printf s)" "$matched_repos" "$count" \
+    "$([[ "$count" == 1 ]] && printf y || printf ies)" "$reset"
+  ((failed == 0)) || printf 'Failed: %s\n' "${failed_repos[*]}"
+} >&2
+
+if ((failed)); then exit 2; fi
+if ((commits)); then exit 0; fi
+exit 1
