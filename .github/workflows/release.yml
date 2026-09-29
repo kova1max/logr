@@ -98,7 +98,17 @@ jobs:
           registry-url: https://registry.npmjs.org
       # Trusted publishing: npm accepts this job's OIDC token because the
       # package trusts kova1max/logr + release.yml (set up with `npm trust`).
-      - run: npm publish
+      # A version npm already has is skipped, so re-running a release whose
+      # other jobs failed doesn't fail here on "cannot publish over".
+      - name: Publish, unless npm already has this version
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          if [ "$(npm view "@kova1/logr@$VERSION" version 2>/dev/null)" = "$VERSION" ]; then
+            echo "::notice::@kova1/logr@$VERSION is already on npm; nothing to publish"
+            exit 0
+          fi
+          npm publish
       # No install check here: npm takes anywhere from minutes to over ten to
       # serve a new version, so waiting on it made releases fail after a
       # successful publish. npm publish exiting 0 is the confirmation.
@@ -126,9 +136,16 @@ jobs:
       # mirror is published as @kova1max/logr while npmjs.org keeps @kova1/logr.
       # The tarball contents are otherwise identical.
       - run: npm pkg set name=@kova1max/logr
-      - run: npm publish
+      - name: Publish, unless GitHub Packages already has this version
         env:
           NODE_AUTH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          if [ "$(npm view "@kova1max/logr@$VERSION" version 2>/dev/null)" = "$VERSION" ]; then
+            echo "::notice::@kova1max/logr@$VERSION is already on GitHub Packages; nothing to publish"
+            exit 0
+          fi
+          npm publish
       - name: Verify the mirrored package is visible
         env:
           NODE_AUTH_TOKEN: ${{ github.token }}
