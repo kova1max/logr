@@ -1,8 +1,19 @@
 {
   "name": "@kova1/logr",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Search the commit history of every git repository under a directory.",
-  "keywords": ["git", "log", "search", "grep", "commits", "cli", "multi-repo", "workspace", "monorepo", "bash"],
+  "keywords": [
+    "git",
+    "log",
+    "search",
+    "grep",
+    "commits",
+    "cli",
+    "multi-repo",
+    "workspace",
+    "monorepo",
+    "bash"
+  ],
   "homepage": "https://github.com/kova1max/logr#readme",
   "bugs": "https://github.com/kova1max/logr/issues",
   "repository": {
@@ -17,7 +28,10 @@
   "files": [
     "bin/logr"
   ],
-  "os": ["darwin", "linux"],
+  "os": [
+    "darwin",
+    "linux"
+  ],
   "scripts": {
     "lint": "shellcheck bin/logr",
     "test": "bats test"
