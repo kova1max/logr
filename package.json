@@ -1,6 +1,6 @@
 {
   "name": "@kova1/logr",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Search the commit history of every git repository under a directory.",
   "keywords": [
     "git",
